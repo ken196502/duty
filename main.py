@@ -29,6 +29,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 OUTLOOK_DIR = BASE_DIR / "outlook"
 ENV_FILE = BASE_DIR / ".env"
+CONTACTS_FILE = BASE_DIR / "contacts.json"
 LOG_DIR = BASE_DIR / "logs"
 
 WEBHOOK_BASE = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send"
@@ -96,29 +97,43 @@ def load_env(path: Path) -> dict[str, str]:
     return env
 
 
-def load_mentions(env: dict[str, str]) -> dict[str, str]:
-    """可选的人员 -> 企业微信 userid 映射，用于在消息里 @ 到具体的人。
+def load_contacts(path: Path) -> dict[str, str]:
+    """读取「姓名 -> 手机号」映射，用于 @ 提醒。
 
-    .env 中可配置（两种写法都支持）::
+    支持两种格式::
 
-        MENTIONS=Joey:zhangsan,Matthew:lisi
-        MENTIONS={"Joey": "zhangsan"}
+        contacts.json  {"Jessie": "85259887686", ...}
+        contacts.txt   Jessie<TAB>85259887686   （也支持逗号/冒号分隔）
     """
-    raw = env.get("MENTIONS", "")
-    if not raw:
+    if not path.exists():
+        logger.warning("未找到通讯录 %s，消息中将不会 @ 任何人", path.name)
         return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        return {str(k).strip(): str(v).strip() for k, v in data.items()}
-    mapping: dict[str, str] = {}
-    for item in raw.split(","):
-        if ":" in item:
-            name, userid = item.split(":", 1)
-            mapping[name.strip()] = userid.strip()
-    return mapping
+
+    text = path.read_text(encoding="utf-8-sig").strip()
+    if not text:
+        return {}
+
+    if path.suffix.lower() == ".json":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            logger.error("通讯录 %s 格式错误：%s", path.name, exc)
+            return {}
+        if not isinstance(data, dict):
+            logger.error("通讯录 %s 应为 {姓名: 手机号} 的对象", path.name)
+            return {}
+        return {str(k).strip(): str(v).strip() for k, v in data.items() if k}
+
+    contacts: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = re.split(r"[\t,:：]", line.strip(), maxsplit=1)
+        if len(parts) == 2:
+            name, mobile = parts[0].strip(), parts[1].strip()
+            if name and mobile:
+                contacts[name] = mobile
+    return contacts
 
 
 # --------------------------------------------------------------------------- #
@@ -249,39 +264,52 @@ def build_message(
     target: dt.date,
     entry: DaySchedule | None,
     source: str,
-    mentions: dict[str, str] | None = None,
-) -> str:
-    mentions = mentions or {}
+    contacts: dict[str, str] | None = None,
+) -> tuple[str, list[str]]:
+    """生成纯文本消息，并返回需要 @ 的手机号列表。
+
+    用手机号 @ 人只能走 text 类型（markdown 不支持 mentioned_mobile_list）。
+    """
+    contacts = contacts or {}
     lines = [
-        "## 明日值班提醒",
-        f"**日期**：{target:%Y-%m-%d} {WEEKDAY_NAMES[target.weekday()]}",
+        "【明日值班提醒】",
+        f"{target:%Y-%m-%d} {WEEKDAY_NAMES[target.weekday()]}",
         "",
     ]
     duties = entry.duties if entry else []
     notes = entry.notes if entry else []
+
+    mobiles: list[str] = []
     if duties:
-        lines.append("**值班安排：**")
+        lines.append("值班安排：")
         for task, person in duties:
-            who = person
-            userid = mentions.get(person)
-            if userid:
-                who = f"{person} (<@{userid}>)"
-            lines.append(f"> {task}：**{who}**")
+            lines.append(f"· {task}：{person}")
+            mobile = contacts.get(person.strip())
+            if mobile and mobile not in mobiles:
+                mobiles.append(mobile)
     else:
-        lines.append("> 明天没有排到值班任务。")
+        lines.append("明天没有排到值班任务。")
     if notes:
         lines.append("")
-        lines.append("**备注：**")
+        lines.append("备注：")
         for note in notes:
-            lines.append(f"> {note}")
+            lines.append(f"  · {note}")
     lines.append("")
-    lines.append(f'<font color="comment">来源：{source}</font>')
-    return "\n".join(lines)
+    lines.append(f"来源：{source}")
+    return "\n".join(lines), mobiles
 
 
-def send_wechat_markdown(webhook_url: str, content: str) -> None:
+def send_wechat_text(
+    webhook_url: str, content: str, mentioned_mobile_list: list[str] | None = None
+) -> None:
     payload = json.dumps(
-        {"msgtype": "markdown", "markdown": {"content": content}},
+        {
+            "msgtype": "text",
+            "text": {
+                "content": content,
+                "mentioned_mobile_list": mentioned_mobile_list or [],
+            },
+        },
         ensure_ascii=False,
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -290,7 +318,10 @@ def send_wechat_markdown(webhook_url: str, content: str) -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    logger.info("发送企业微信 Webhook：%s（%d 字节）", mask_url(webhook_url), len(payload))
+    logger.info(
+        "发送企业微信 Webhook：%s（%d 字节，@ %s）",
+        mask_url(webhook_url), len(payload), mentioned_mobile_list or "-",
+    )
     with urllib.request.urlopen(request, timeout=10) as response:
         result = json.loads(response.read().decode("utf-8"))
     if result.get("errcode") != 0:
@@ -326,6 +357,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--date", help="提醒哪一天（YYYY-MM-DD），默认明天")
     parser.add_argument("--csv-dir", default=str(OUTLOOK_DIR), help="CSV 所在目录")
     parser.add_argument("--dry-run", action="store_true", help="只打印消息，不发送 Webhook")
+    parser.add_argument(
+        "--contacts", default=str(CONTACTS_FILE), help=f"通讯录文件，默认 {CONTACTS_FILE.name}"
+    )
     parser.add_argument("--log-dir", default=str(LOG_DIR), help=f"日志目录，默认 {LOG_DIR}")
     parser.add_argument("--log-level", default="INFO", help="DEBUG/INFO/WARNING/ERROR，默认 INFO")
     args = parser.parse_args(argv)
@@ -348,7 +382,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     env = {**load_env(ENV_FILE), **os.environ}
-    message = build_message(target, entry, source, load_mentions(env))
+    contacts = load_contacts(Path(args.contacts))
+    message, mobiles = build_message(target, entry, source, contacts)
+    for name, mobile in contacts.items():
+        if mobile in mobiles:
+            logger.debug("将 @ %s（%s）", name, mobile)
 
     logger.info("消息内容：\n%s", message)
 
@@ -365,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         webhook_url = f"{WEBHOOK_BASE}?key={webhook_key}"
 
     try:
-        send_wechat_markdown(webhook_url, message)
+        send_wechat_text(webhook_url, message, mobiles)
     except (urllib.error.URLError, RuntimeError, OSError) as exc:
         logger.exception("发送失败：%s", exc)
         return 1

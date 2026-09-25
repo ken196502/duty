@@ -11,5 +11,9 @@ wheels/
 
 # Logs
 logs/
+
+# Secrets
+.env
 outlook/
 .env
+contacts.json
