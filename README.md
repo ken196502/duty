@@ -22,7 +22,14 @@ python main.py                      # 提醒明天的值班并发送
 python main.py --dry-run            # 只打印消息，不发送（自测用）
 python main.py --date 2026-09-26    # 指定日期
 python main.py --csv-dir D:\share   # 指定 CSV 目录
+python main.py --log-dir D:\logs    # 指定日志目录
+python main.py --log-level DEBUG    # 更详细的日志
 ```
+
+## 日志
+
+同时输出到控制台和 `logs/duty.log`，按天轮转、保留 30 天（`logs/` 已加入 .gitignore）。
+日志中会脱敏 webhook key（`key=ba055da0***`）。
 
 ## CSV 约定
 
