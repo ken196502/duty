@@ -8,6 +8,8 @@
     python main.py                      # 提醒明天的值班
     python main.py --date 2026-09-26    # 提醒指定日期
     python main.py --dry-run            # 只打印消息，不发送
+
+班表来源：默认从 SMB 共享读取（.env 里配 SMB_*），读不到自动回落到本地 outlook/。
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import io
 import json
 import logging
 import logging.handlers
@@ -63,6 +66,9 @@ def setup_logging(level: str = "INFO", log_dir: Path = LOG_DIR) -> None:
     console = logging.StreamHandler(stream=sys.stdout)
     console.setFormatter(fmt)
     logger.addHandler(console)
+
+    # smbprotocol 关闭连接时会刷 "socket aborted by peer"，属于正常现象，屏蔽掉
+    logging.getLogger("smbprotocol").setLevel(logging.ERROR)
 
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -137,7 +143,122 @@ def load_contacts(path: Path) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# CSV 解析
+# 班表来源：SMB 共享 / 本地目录
+# --------------------------------------------------------------------------- #
+@dataclass
+class SmbConfig:
+    server: str
+    share: str
+    subdir: str
+    username: str
+    password: str
+    port: int = 445
+
+    @classmethod
+    def from_env(cls, env: dict[str, str]) -> "SmbConfig | None":
+        server = env.get("SMB_SERVER", "").strip()
+        if not server:
+            return None
+        # SMB_DIR 形如 "Settlement Internal\结算部排班表"：第一段是共享名
+        raw_dir = env.get("SMB_DIR", "").strip().strip("\\/")
+        share, _, subdir = raw_dir.partition("\\")
+        share = env.get("SMB_SHARE", "").strip() or share
+        if not share:
+            logger.warning("SMB_DIR 未包含共享名，例如 SMB_DIR=ShareName\\子目录")
+            return None
+        return cls(
+            server=server,
+            share=share,
+            subdir=subdir.replace("/", "\\"),
+            username=env.get("SMB_USERNAME", "").strip(),
+            password=env.get("SMB_PASSWORD", ""),
+            port=int(env.get("SMB_PORT", "445") or 445),
+        )
+
+    def unc(self, *parts: str) -> str:
+        path = "\\".join(p for p in (self.share, self.subdir, *parts) if p)
+        return f"\\\\{self.server}\\{path}"
+
+    def __str__(self) -> str:
+        return f"\\\\{self.server}\\{self.share}\\{self.subdir}".rstrip("\\")
+
+
+def smb_list_files(cfg: SmbConfig) -> list[tuple[str, float]]:
+    """列出共享目录里的班表文件（xlsx/csv），返回 [(文件名, 修改时间)]，按时间倒序。"""
+    import smbclient  # 延迟导入：本地模式下不强制依赖
+
+    smbclient.register_session(
+        cfg.server, username=cfg.username, password=cfg.password, port=cfg.port
+    )
+    try:
+        entries = []
+        with smbclient.scandir(cfg.unc()) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.lower().endswith((".xlsx", ".xlsm", ".csv")):
+                    entries.append((entry.name, entry.stat().st_mtime))
+        entries.sort(key=lambda x: x[1], reverse=True)
+        logger.info("SMB %s 下共 %d 个班表文件：%s", cfg, len(entries), ", ".join(n for n, _ in entries))
+        return entries
+    finally:
+        smbclient.delete_session(cfg.server, port=cfg.port)
+
+
+def smb_read_bytes(cfg: SmbConfig, name: str) -> bytes:
+    """从 SMB 读取一个文件的原始字节。"""
+    import smbclient
+
+    smbclient.register_session(
+        cfg.server, username=cfg.username, password=cfg.password, port=cfg.port
+    )
+    try:
+        with smbclient.open_file(cfg.unc(name), mode="rb") as fh:
+            data = fh.read()
+        logger.info("已读取 SMB 文件 %s（%d 字节）", name, len(data))
+        return data
+    finally:
+        smbclient.delete_session(cfg.server, port=cfg.port)
+
+
+def _pick_names(names: list[str], target: dt.date) -> list[str]:
+    """优先挑文件名含目标年份的班表（如 «结算部 排班表 2026.xlsx»），否则按名称倒序。"""
+    year_names = [n for n in names if f"{target:%Y}" in n]
+    return year_names or sorted(names, reverse=True)
+
+
+def fetch_schedules(mode: str, csv_dir: Path, env: dict[str, str], target: dt.date):
+    """取得 [(来源名, {日期: DaySchedule})]，已按优先级排序。默认走 SMB。"""
+    if mode in ("auto", "smb"):
+        cfg = SmbConfig.from_env(env)
+        if cfg is None:
+            logger.warning("未配置 SMB_SERVER / SMB_DIR，跳过 SMB 读取")
+        else:
+            try:
+                names = [n for n, _ in smb_list_files(cfg)]
+                docs: list[tuple[str, dict]] = []
+                for name in _pick_names(names, target)[:2]:
+                    data = smb_read_bytes(cfg, name)
+                    if name.lower().endswith(".csv"):
+                        docs.append((name, parse_csv_text(data.decode("utf-8-sig", errors="replace"), name)))
+                    else:
+                        docs.extend(parse_xlsx_bytes(data, name, target))
+                if docs:
+                    return docs
+                logger.warning("SMB %s 下没有可用的班表文件", cfg)
+            except Exception as exc:  # SMB 不可用时不影响本地兜底
+                logger.exception("读取 SMB 失败：%s", exc)
+                if mode == "smb":
+                    raise
+
+    candidates = sorted(csv_dir.glob("*.csv"))
+    if not candidates:
+        raise FileNotFoundError(f"目录中没有找到 CSV：{csv_dir}")
+    logger.info("本地目录 %s 找到 %d 份班表：%s", csv_dir, len(candidates), ", ".join(p.name for p in candidates))
+    picked = _pick_names([p.name for p in candidates], target)[:3]
+    return [(name, parse_csv_text((csv_dir / name).read_text(encoding="utf-8-sig", errors="replace"), name)) for name in picked]
+
+
+# --------------------------------------------------------------------------- #
+# 班表解析（CSV / XLSX 共用一套「月历网格」解析）
 # --------------------------------------------------------------------------- #
 @dataclass
 class DaySchedule:
@@ -187,20 +308,36 @@ def _resolve_week_dates(days: list[int | None], year: int, month: int, prev_day:
     return dates, year, month, prev_day
 
 
-def parse_csv(path: Path) -> dict[dt.date, DaySchedule]:
-    """把一个 Outlook 月历 CSV 解析成 {日期: DaySchedule}。
+def cell_day(value) -> int | None:
+    """日期单元格 -> 日号。CSV 里是 "1900/1/30" 文本，XLSX 里是 date/datetime。"""
+    if isinstance(value, dt.datetime):
+        return value.day
+    if isinstance(value, dt.date):
+        return value.day
+    if isinstance(value, str):
+        m = DATE_CELL_RE.match(value.strip())
+        if m:
+            return int(m.group(1))
+    return None
 
-    CSV 结构：第一行是标题（含年月），第二行是星期名，紧接着一行是日期
-    （形如 1900/1/30，只有「日」有效）；之后每一行都是这一周 7 个单元格
-    的续行，直到下一个日期行出现。
+
+def cell_text(value) -> str:
+    """非日期单元格 -> 文本。"""
+    if isinstance(value, (dt.date, dt.datetime)):
+        return ""
+    return "" if value is None else str(value).strip()
+
+
+def parse_grid(grid, source: str = "") -> dict[dt.date, DaySchedule]:
+    """解析 Outlook 月历网格（7 列：日到六）为 {日期: DaySchedule}。
+
+    网格第一行是标题（含年月），第二行是星期名；之后是「日期行 / 内容行」交替出现
+    （CSV 里一个日期行会跟多行内容，XLSX 里通常一行日期一行内容）。
     """
-    # 单元格内含换行，必须让 csv 模块读取原始流，不能用 read_text().splitlines()
-    with path.open(encoding="utf-8-sig", newline="") as fh:
-        rows = list(csv.reader(fh))
-    if not rows:
+    if not grid:
         return {}
 
-    title = " ".join(rows[0])
+    title = " ".join(cell_text(c) for c in grid[0])
     match = TITLE_RE.search(title)
     base_year = int(match.group(1)) if match else dt.date.today().year
     base_month = int(match.group(2)) if match else dt.date.today().month
@@ -221,17 +358,12 @@ def parse_csv(path: Path) -> dict[dt.date, DaySchedule]:
             entry.duties.extend(duties)
             entry.notes.extend(notes)
 
-    for row in rows:
-        cells = (list(row) + [""] * (COLUMNS + 1))[: COLUMNS + 1]
-        body = [cells[i].strip() for i in range(1, COLUMNS + 1)]
-        if DATE_CELL_RE.match(body[0]):
-            days: list[int | None] = []
-            for cell in body:
-                m = DATE_CELL_RE.match(cell)
-                days.append(int(m.group(1)) if m else None)
-            # 首行不是 1 号 => 该周属于上个月
+    for row in grid:
+        body = list(row)[:COLUMNS] + [""] * (COLUMNS - min(len(row), COLUMNS))
+        days = [cell_day(c) for c in body]
+        if sum(d is not None for d in days) >= 2:  # 一行里有多个日期 => 日期行
             if first_week and days[0] not in (None, 1):
-                month -= 1
+                month -= 1  # 首行不是 1 号 => 该周属于上个月
                 if month < 1:
                     month, year = 12, year - 1
             first_week = False
@@ -242,19 +374,49 @@ def parse_csv(path: Path) -> dict[dt.date, DaySchedule]:
         if not week_dates:
             continue
         for i, cell in enumerate(body):
-            if cell:
-                buffers[i] = f"{buffers[i]}\n{cell}" if buffers[i] else cell
+            text = cell_text(cell)
+            if text:
+                buffers[i] = f"{buffers[i]}\n{text}" if buffers[i] else text
     flush()
 
     if schedule:
         dates = sorted(schedule)
         logger.info(
             "解析 %s：%d 条排班（%s ~ %s）",
-            path.name, len(schedule), dates[0], dates[-1],
+            source or "CSV", len(schedule), dates[0], dates[-1],
         )
     else:
-        logger.warning("解析 %s：没有识别到任何排班，请检查 CSV 格式", path.name)
+        logger.warning("解析 %s：没有识别到任何排班，请检查格式", source or "班表")
     return schedule
+
+
+def parse_csv_text(text: str, source: str = "") -> dict[dt.date, DaySchedule]:
+    """解析 Outlook 月历 CSV 文本。单元格内含换行，必须让 csv 模块按流解析。"""
+    return parse_grid(list(csv.reader(io.StringIO(text, newline=""))), source)
+
+
+def parse_xlsx_bytes(data: bytes, source: str, target: dt.date) -> list[tuple[str, dict]]:
+    """解析 xlsx 班表：每个月份一个 sheet，返回 [(来源名, {日期: DaySchedule})]。
+
+    优先解析目标月份所在 sheet，其次相邻月份（跨月边缘的日期会用得上）。
+    """
+    from python_calamine import CalamineWorkbook  # 延迟导入
+
+    workbook = CalamineWorkbook.from_object(io.BytesIO(data))
+    wanted = {(target.month - 1) % 12 or 12, target.month, target.month % 12 + 1}
+
+    docs: list[tuple[str, dict]] = []
+    for name in workbook.sheet_names:
+        m = re.search(r"\d+", name)
+        sheet_month = int(m.group()) if m else None
+        if sheet_month is not None and sheet_month not in wanted:
+            continue
+        grid = workbook.get_sheet_by_name(name).to_python()
+        label = f"{source}::{name}"
+        docs.append((label, parse_grid(grid, label)))
+        if len(docs) >= 3:
+            break
+    return docs
 
 
 # --------------------------------------------------------------------------- #
@@ -332,30 +494,25 @@ def send_wechat_text(
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
-def collect_schedule(csv_dir: Path, target: dt.date) -> tuple[DaySchedule | None, str]:
-    """在所有 CSV 中查找 ``target`` 的排班，返回 (排班, 来源文件名)。"""
-    candidates = sorted(csv_dir.glob("*.csv"))
-    if not candidates:
-        raise FileNotFoundError(f"目录中没有找到 CSV：{csv_dir}")
-    logger.info("在 %s 找到 %d 份班表：%s", csv_dir, len(candidates), ", ".join(p.name for p in candidates))
-
-    # 优先使用文件名正好对应目标月份的那份表
-    preferred = f"{target:%Y-%m}.csv"
-    candidates.sort(key=lambda p: (p.name != preferred, p.name))
-
-    for path in candidates:
-        entry = parse_csv(path).get(target)
+def collect_schedule(documents, target: dt.date) -> tuple[DaySchedule | None, str]:
+    """在已解析好的 [(来源名, {日期: DaySchedule})] 中查找 ``target`` 的排班。"""
+    for name, schedule in documents:
+        entry = schedule.get(target)
         if entry and not entry.is_empty:
-            logger.info("命中 %s 的排班，来源：%s", target, path.name)
-            return entry, path.name
+            logger.info("命中 %s 的排班，来源：%s", target, name)
+            return entry, name
     logger.warning("%s 在所有班表中都没有排班记录", target)
-    return None, f"{preferred}(未找到排班)"
+    first = documents[0][0] if documents else "无班表"
+    return None, f"{first}(未找到排班)"
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="读取 Outlook 值班 CSV，提醒明天的值班安排")
     parser.add_argument("--date", help="提醒哪一天（YYYY-MM-DD），默认明天")
-    parser.add_argument("--csv-dir", default=str(OUTLOOK_DIR), help="CSV 所在目录")
+    parser.add_argument("--csv-dir", default=str(OUTLOOK_DIR), help="本地 CSV 目录（local 模式）")
+    parser.add_argument(
+        "--source", choices=["auto", "smb", "local"], default="auto", help="班表来源，默认先 SMB 后本地"
+    )
     parser.add_argument("--dry-run", action="store_true", help="只打印消息，不发送 Webhook")
     parser.add_argument(
         "--contacts", default=str(CONTACTS_FILE), help=f"通讯录文件，默认 {CONTACTS_FILE.name}"
@@ -374,14 +531,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     logger.info("提醒日期：%s", target)
 
-    csv_dir = Path(args.csv_dir)
+    env = {**load_env(ENV_FILE), **os.environ}
     try:
-        entry, source = collect_schedule(csv_dir, target)
+        documents = fetch_schedules(args.source, Path(args.csv_dir), env, target)
     except FileNotFoundError as exc:
         logger.error("%s", exc)
         return 1
+    entry, source = collect_schedule(documents, target)
 
-    env = {**load_env(ENV_FILE), **os.environ}
     contacts = load_contacts(Path(args.contacts))
     message, mobiles = build_message(target, entry, source, contacts)
     for name, mobile in contacts.items():
