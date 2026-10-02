@@ -40,9 +40,16 @@ WEBHOOK_BASE = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send"
 # Outlook 导出的日期形如 1900/1/30，只有「日」有意义，月份需要按跨月推算
 DATE_CELL_RE = re.compile(r"^\d{4}/\d{1,2}/(\d{1,2})$")
 TITLE_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月")
+SHEET_MONTH_RE = re.compile(r"(\d{1,2})\s*月")
 NOTE_RE = re.compile(r"^[*#]")
 KEY_RE = re.compile(r"(key=)([^&\s]+)")
 COLUMNS = 7
+
+# sheet 名里的英文月份缩写（如 "OCT 2026"）
+EN_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 WEEKDAY_NAMES = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
@@ -309,11 +316,20 @@ def _resolve_week_dates(days: list[int | None], year: int, month: int, prev_day:
 
 
 def cell_day(value) -> int | None:
-    """日期单元格 -> 日号。CSV 里是 "1900/1/30" 文本，XLSX 里是 date/datetime。"""
+    """日期单元格 -> 日号。
+
+    CSV 里是 "1900/1/30" 文本；XLSX 里通常是 date/datetime，
+    但偶尔会被存成纯数字（如 23.0），这里一并认。
+    """
     if isinstance(value, dt.datetime):
         return value.day
     if isinstance(value, dt.date):
         return value.day
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        day = int(value)
+        return day if value == day and 1 <= day <= 31 else None
     if isinstance(value, str):
         m = DATE_CELL_RE.match(value.strip())
         if m:
@@ -395,10 +411,32 @@ def parse_csv_text(text: str, source: str = "") -> dict[dt.date, DaySchedule]:
     return parse_grid(list(csv.reader(io.StringIO(text, newline=""))), source)
 
 
+def sheet_month(name: str) -> int | None:
+    """从 sheet 名推断月份；读不出来返回 None（调用方应照旧解析，不要跳过）。
+
+    只认三种写法："10 月"/"10月"、英文月份缩写（OCT）、纯数字（"10"）。
+    像 "工作表1" 这种 Excel 默认表名不算月份——否则会被当成 1 月而整表跳过。
+    """
+    m = SHEET_MONTH_RE.search(name)
+    if m:
+        month = int(m.group(1))
+        return month if 1 <= month <= 12 else None
+    lowered = name.lower()
+    for word, month in EN_MONTHS.items():
+        if re.search(rf"(?<![a-z]){word}", lowered):
+            return month
+    stripped = name.strip()
+    if stripped.isdigit():
+        month = int(stripped)
+        return month if 1 <= month <= 12 else None
+    return None
+
+
 def parse_xlsx_bytes(data: bytes, source: str, target: dt.date) -> list[tuple[str, dict]]:
     """解析 xlsx 班表：每个月份一个 sheet，返回 [(来源名, {日期: DaySchedule})]。
 
-    优先解析目标月份所在 sheet，其次相邻月份（跨月边缘的日期会用得上）。
+    优先解析目标月份所在 sheet，其次相邻月份（跨月边缘的日期会用得上）；
+    sheet 名读不出月份时一律解析，避免整本表被静默跳过。
     """
     from python_calamine import CalamineWorkbook  # 延迟导入
 
@@ -407,15 +445,19 @@ def parse_xlsx_bytes(data: bytes, source: str, target: dt.date) -> list[tuple[st
 
     docs: list[tuple[str, dict]] = []
     for name in workbook.sheet_names:
-        m = re.search(r"\d+", name)
-        sheet_month = int(m.group()) if m else None
-        if sheet_month is not None and sheet_month not in wanted:
+        month = sheet_month(name)
+        if month is not None and month not in wanted:
+            logger.debug("跳过 sheet %s（%d 月，不在 %s 附近）", name, month, sorted(wanted))
             continue
         grid = workbook.get_sheet_by_name(name).to_python()
         label = f"{source}::{name}"
         docs.append((label, parse_grid(grid, label)))
         if len(docs) >= 3:
             break
+    if not docs:
+        logger.warning(
+            "%s 中没有目标月份的 sheet（共有：%s）", source, "、".join(workbook.sheet_names)
+        )
     return docs
 
 
