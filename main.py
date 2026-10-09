@@ -1,6 +1,6 @@
 """明日值班提醒。
 
-从 Outlook 导出的 CSV 月度班表中读取排班，找出「明天」的值班安排，
+从 SMB 共享上的月度班表中读取排班，找出「明天」的值班安排，
 并通过企业微信群机器人 Webhook 发送提醒。
 
 用法::
@@ -9,7 +9,9 @@
     python main.py --date 2026-09-26    # 提醒指定日期
     python main.py --dry-run            # 只打印消息，不发送
 
-班表来源：默认从 SMB 共享读取（.env 里配 SMB_*），读不到自动回落到本地 outlook/。
+班表来源：从 SMB 共享读取（.env 里配 SMB_*）。
+取不到班表（共享权限被关、账号失效、网络故障等）时不会静默退出，
+会往群里发一条 `【值班提醒运行失败】` 告警（--dry-run 下只打印）。
 """
 
 from __future__ import annotations
@@ -24,13 +26,11 @@ import logging.handlers
 import os
 import re
 import sys
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-OUTLOOK_DIR = BASE_DIR / "outlook"
 ENV_FILE = BASE_DIR / ".env"
 CONTACTS_FILE = BASE_DIR / "contacts.json"
 LOG_DIR = BASE_DIR / "logs"
@@ -52,6 +52,9 @@ EN_MONTHS = {
 }
 
 WEEKDAY_NAMES = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+# 星期表头行（用来定位日期列从第几列开始）
+WEEKDAY_HEADER_RE = re.compile(r"(星期[日一二三四五六]|週[日一二三四五六]|周[日一二三四五六])")
 
 logger = logging.getLogger("duty")
 
@@ -150,7 +153,7 @@ def load_contacts(path: Path) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# 班表来源：SMB 共享 / 本地目录
+# 班表来源：SMB 共享
 # --------------------------------------------------------------------------- #
 @dataclass
 class SmbConfig:
@@ -190,40 +193,87 @@ class SmbConfig:
         return f"\\\\{self.server}\\{self.share}\\{self.subdir}".rstrip("\\")
 
 
+class SmbAccessError(RuntimeError):
+    """SMB 共享无法访问（权限被关、账号失效、路径/网络问题等）。"""
+
+
+# NtStatus -> 人话提示（权限被关时不要只丢一堆十六进制给值班的人）
+NT_STATUS_HINTS = {
+    "0xc0000022": "访问被拒绝：共享目录权限被关闭，或账号已失效",
+    "0xc000006d": "登录失败：SMB 账号或密码不正确",
+    "0xc000006e": "账号被禁用或受登录时间限制",
+    "0xc000006f": "账号登录时间/工作站受限",
+    "0xc0000070": "账号密码已过期",
+    "0xc0000072": "账号已被禁用",
+    "0xc00000cc": "共享名不存在（SMB_DIR 第一段写错？）",
+    "0xc0000034": "路径不存在（找不到对象名）",
+    "0xc000003a": "路径不存在（找不到指定文件）",
+    "0xc0000203": "已达到该共享的连接数上限",
+    "0xc000000d": "请求参数无效（路径写法有误？）",
+}
+
+
+def describe_smb_error(exc: BaseException) -> str:
+    """把 smbprotocol 的异常翻译成可读的一句话。"""
+    text = str(exc)
+    match = re.search(r"0x[0-9a-fA-F]{8}", text)
+    if match:
+        hint = NT_STATUS_HINTS.get(match.group(0).lower())
+        if hint:
+            return f"{hint}（NtStatus {match.group(0)}）"
+        return f"SMB 错误 NtStatus {match.group(0)}：{text}"
+    name = type(exc).__name__
+    lowered = text.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        return f"连接 {name} 超时：服务器不可达或网络不通"
+    return f"{name}：{text or '未知 SMB 错误'}"
+
+
+def smb_session(cfg: SmbConfig):
+    """注册 SMB 会话；失败统一转成 SmbAccessError。"""
+    import smbclient  # 延迟导入：用到 SMB 时才加载
+
+    try:
+        smbclient.register_session(
+            cfg.server, username=cfg.username, password=cfg.password, port=cfg.port
+        )
+    except Exception as exc:  # 登录失败/网络不通都算「取不到班表」
+        raise SmbAccessError(f"连接 {cfg} 失败：{describe_smb_error(exc)}") from exc
+    return smbclient
+
+
 def smb_list_files(cfg: SmbConfig) -> list[tuple[str, float]]:
     """列出共享目录里的班表文件（xlsx/csv），返回 [(文件名, 修改时间)]，按时间倒序。"""
-    import smbclient  # 延迟导入：本地模式下不强制依赖
-
-    smbclient.register_session(
-        cfg.server, username=cfg.username, password=cfg.password, port=cfg.port
-    )
+    smbclient = smb_session(cfg)
     try:
         entries = []
         with smbclient.scandir(cfg.unc()) as it:
             for entry in it:
                 if entry.is_file() and entry.name.lower().endswith((".xlsx", ".xlsm", ".csv")):
                     entries.append((entry.name, entry.stat().st_mtime))
-        entries.sort(key=lambda x: x[1], reverse=True)
-        logger.info("SMB %s 下共 %d 个班表文件：%s", cfg, len(entries), ", ".join(n for n, _ in entries))
-        return entries
+    except Exception as exc:
+        raise SmbAccessError(f"无法列出 {cfg}：{describe_smb_error(exc)}") from exc
     finally:
         smbclient.delete_session(cfg.server, port=cfg.port)
+
+    entries.sort(key=lambda x: x[1], reverse=True)
+    logger.info("SMB %s 下共 %d 个班表文件：%s", cfg, len(entries), ", ".join(n for n, _ in entries))
+    return entries
 
 
 def smb_read_bytes(cfg: SmbConfig, name: str) -> bytes:
     """从 SMB 读取一个文件的原始字节。"""
-    import smbclient
-
-    smbclient.register_session(
-        cfg.server, username=cfg.username, password=cfg.password, port=cfg.port
-    )
+    smbclient = smb_session(cfg)
     try:
         with smbclient.open_file(cfg.unc(name), mode="rb") as fh:
             data = fh.read()
-        logger.info("已读取 SMB 文件 %s（%d 字节）", name, len(data))
-        return data
+    except Exception as exc:
+        raise SmbAccessError(f"无法读取 {cfg.unc(name)}：{describe_smb_error(exc)}") from exc
     finally:
         smbclient.delete_session(cfg.server, port=cfg.port)
+
+    logger.info("已读取 SMB 文件 %s（%d 字节）", name, len(data))
+    return data
 
 
 def _pick_names(names: list[str], target: dt.date) -> list[str]:
@@ -232,36 +282,26 @@ def _pick_names(names: list[str], target: dt.date) -> list[str]:
     return year_names or sorted(names, reverse=True)
 
 
-def fetch_schedules(mode: str, csv_dir: Path, env: dict[str, str], target: dt.date):
-    """取得 [(来源名, {日期: DaySchedule})]，已按优先级排序。默认走 SMB。"""
-    if mode in ("auto", "smb"):
-        cfg = SmbConfig.from_env(env)
-        if cfg is None:
-            logger.warning("未配置 SMB_SERVER / SMB_DIR，跳过 SMB 读取")
-        else:
-            try:
-                names = [n for n, _ in smb_list_files(cfg)]
-                docs: list[tuple[str, dict]] = []
-                for name in _pick_names(names, target)[:2]:
-                    data = smb_read_bytes(cfg, name)
-                    if name.lower().endswith(".csv"):
-                        docs.append((name, parse_csv_text(data.decode("utf-8-sig", errors="replace"), name)))
-                    else:
-                        docs.extend(parse_xlsx_bytes(data, name, target))
-                if docs:
-                    return docs
-                logger.warning("SMB %s 下没有可用的班表文件", cfg)
-            except Exception as exc:  # SMB 不可用时不影响本地兜底
-                logger.exception("读取 SMB 失败：%s", exc)
-                if mode == "smb":
-                    raise
+def fetch_schedules(env: dict[str, str], target: dt.date):
+    """从 SMB 共享取得 [(来源名, {日期: DaySchedule})]，已按优先级排序。"""
+    cfg = SmbConfig.from_env(env)
+    if cfg is None:
+        raise RuntimeError("未配置 SMB_SERVER / SMB_DIR，请在 .env 中配置")
 
-    candidates = sorted(csv_dir.glob("*.csv"))
-    if not candidates:
-        raise FileNotFoundError(f"目录中没有找到 CSV：{csv_dir}")
-    logger.info("本地目录 %s 找到 %d 份班表：%s", csv_dir, len(candidates), ", ".join(p.name for p in candidates))
-    picked = _pick_names([p.name for p in candidates], target)[:3]
-    return [(name, parse_csv_text((csv_dir / name).read_text(encoding="utf-8-sig", errors="replace"), name)) for name in picked]
+    names = [n for n, _ in smb_list_files(cfg)]
+    if not names:
+        raise FileNotFoundError(f"SMB {cfg} 下没有班表文件（xlsx/xlsm/csv）")
+
+    docs: list[tuple[str, dict]] = []
+    for name in _pick_names(names, target)[:2]:
+        data = smb_read_bytes(cfg, name)
+        if name.lower().endswith(".csv"):
+            docs.append(
+                (name, parse_csv_text(data.decode("utf-8-sig", errors="replace"), name))
+            )
+        else:
+            docs.extend(parse_xlsx_bytes(data, name, target))
+    return docs
 
 
 # --------------------------------------------------------------------------- #
@@ -311,7 +351,11 @@ def _resolve_week_dates(days: list[int | None], year: int, month: int, prev_day:
             if month > 12:
                 month, year = 1, year + 1
         prev_day = day
-        dates.append(dt.date(year, month, day))
+        try:
+            dates.append(dt.date(year, month, day))
+        except ValueError:  # 兜底：推算出的日期不存在（如 9/31）就丢弃，别让整份表解析失败
+            logger.warning("忽略非法日期 %04d-%02d-%02d", year, month, day)
+            dates.append(None)
     return dates, year, month, prev_day
 
 
@@ -344,6 +388,19 @@ def cell_text(value) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _date_col_offset(grid) -> int:
+    """日期列在网格里的起始下标。
+
+    Outlook 导出的月历左侧常常多一列（空列 / 行号列），直接按前 7 列取会把
+    星期整体错位一天。这里用「星期表头行」定位真正的起始列。
+    """
+    for row in grid[:3]:
+        for i, cell in enumerate(row):
+            if WEEKDAY_HEADER_RE.search(cell_text(cell)):
+                return i
+    return 0
+
+
 def parse_grid(grid, source: str = "") -> dict[dt.date, DaySchedule]:
     """解析 Outlook 月历网格（7 列：日到六）为 {日期: DaySchedule}。
 
@@ -353,6 +410,7 @@ def parse_grid(grid, source: str = "") -> dict[dt.date, DaySchedule]:
     if not grid:
         return {}
 
+    offset = _date_col_offset(grid)
     title = " ".join(cell_text(c) for c in grid[0])
     match = TITLE_RE.search(title)
     base_year = int(match.group(1)) if match else dt.date.today().year
@@ -375,7 +433,7 @@ def parse_grid(grid, source: str = "") -> dict[dt.date, DaySchedule]:
             entry.notes.extend(notes)
 
     for row in grid:
-        body = list(row)[:COLUMNS] + [""] * (COLUMNS - min(len(row), COLUMNS))
+        body = (list(row)[offset:] + [""] * COLUMNS)[:COLUMNS]
         days = [cell_day(c) for c in body]
         if sum(d is not None for d in days) >= 2:  # 一行里有多个日期 => 日期行
             if first_week and days[0] not in (None, 1):
@@ -503,6 +561,70 @@ def build_message(
     return "\n".join(lines), mobiles
 
 
+def build_error_message(
+    target: dt.date,
+    exc: BaseException,
+    smb_path: str = "",
+    alert_mobiles: list[str] | None = None,
+) -> tuple[str, list[str]]:
+    """生成「运行失败」告警消息（同样走 text，以便 @ 人）。"""
+    reason = str(exc) if isinstance(exc, (SmbAccessError, RuntimeError, ValueError)) else (
+        f"{type(exc).__name__}：{exc}"
+    )
+    lines = [
+        "【值班提醒运行失败】",
+        f"{target:%Y-%m-%d} {WEEKDAY_NAMES[target.weekday()]}",
+        "",
+        f"失败时间：{dt.datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"失败原因：{reason or type(exc).__name__}",
+    ]
+    if smb_path:
+        lines.append(f"共享路径：{smb_path}")
+    lines.extend(
+        [
+            "",
+            "今天没有发出明日值班提醒，请检查共享目录权限 / SMB 账号后手动补发。",
+        ]
+    )
+    return "\n".join(lines), list(alert_mobiles or [])
+
+
+def resolve_webhook(env: dict[str, str]) -> str:
+    """WEBHOOK_URL 优先，其次 WEBHOOK_KEY；都没有返回空串。"""
+    url = (env.get("WEBHOOK_URL") or "").strip()
+    if url:
+        return url
+    key = (env.get("WEBHOOK_KEY") or "").strip()
+    return f"{WEBHOOK_BASE}?key={key}" if key else ""
+
+
+def alert_mobiles(env: dict[str, str]) -> list[str]:
+    """告警 @ 谁：ALERT_MOBILES（逗号分隔），未配置则 @all，确保有人看到。"""
+    raw = (env.get("ALERT_MOBILES") or "").strip()
+    mobiles = [m.strip() for m in re.split(r"[,，;；\s]+", raw) if m.strip()]
+    return mobiles or ["@all"]
+
+
+def notify_failure(
+    env: dict[str, str], target: dt.date, exc: BaseException, smb_path: str = "", dry_run: bool = False
+) -> None:
+    """运行失败时发群告警；告警本身失败只记日志，不能把主流程再炸一次。"""
+    message, mobiles = build_error_message(target, exc, smb_path, alert_mobiles(env))
+    logger.error("运行失败，告警内容：\n%s", message)
+
+    if dry_run:
+        logger.info("[dry-run] 未发送告警。")
+        return
+    webhook_url = resolve_webhook(env)
+    if not webhook_url:
+        logger.error("缺少 WEBHOOK_KEY / WEBHOOK_URL，无法发送告警")
+        return
+    try:
+        send_wechat_text(webhook_url, message, mobiles)
+    except Exception as send_exc:  # noqa: BLE001 - 兜底，告警失败也只记日志
+        logger.exception("告警发送失败：%s", send_exc)
+
+
 def send_wechat_text(
     webhook_url: str, content: str, mentioned_mobile_list: list[str] | None = None
 ) -> None:
@@ -548,13 +670,52 @@ def collect_schedule(documents, target: dt.date) -> tuple[DaySchedule | None, st
     return None, f"{first}(未找到排班)"
 
 
+def smb_path(env: dict[str, str]) -> str:
+    """告警里展示的共享路径；未配置就返回空串。"""
+    cfg = SmbConfig.from_env(env)
+    return str(cfg) if cfg else ""
+
+
+def run(args, env: dict[str, str], target: dt.date) -> int:
+    """真正跑一轮：取班表 -> 拼消息 -> 发提醒。失败一律告警（除非 dry-run）。"""
+    try:
+        documents = fetch_schedules(env, target)
+    except Exception as exc:  # noqa: BLE001 - 权限被关/网络故障/班表缺失都要发告警
+        logger.error("读取班表失败：%s", exc, exc_info=True)
+        notify_failure(env, target, exc, smb_path(env), args.dry_run)
+        return 1
+    entry, source = collect_schedule(documents, target)
+
+    contacts = load_contacts(Path(args.contacts))
+    message, mobiles = build_message(target, entry, source, contacts)
+    for name, mobile in contacts.items():
+        if mobile in mobiles:
+            logger.debug("将 @ %s（%s）", name, mobile)
+
+    logger.info("消息内容：\n%s", message)
+
+    if args.dry_run:
+        logger.info("[dry-run] 未发送。")
+        return 0
+
+    webhook_url = resolve_webhook(env)
+    if not webhook_url:
+        logger.error("缺少 WEBHOOK_KEY / WEBHOOK_URL，请在 .env 中配置")
+        return 1
+
+    try:
+        send_wechat_text(webhook_url, message, mobiles)
+    except Exception as exc:  # noqa: BLE001 - 发送失败也要让群里知道
+        logger.exception("发送失败：%s", exc)
+        notify_failure(env, target, exc, smb_path(env), args.dry_run)
+        return 1
+    logger.info("=== 值班提醒完成 ===")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="读取 Outlook 值班 CSV，提醒明天的值班安排")
+    parser = argparse.ArgumentParser(description="读取 SMB 共享上的排班表，提醒明天的值班安排")
     parser.add_argument("--date", help="提醒哪一天（YYYY-MM-DD），默认明天")
-    parser.add_argument("--csv-dir", default=str(OUTLOOK_DIR), help="本地 CSV 目录（local 模式）")
-    parser.add_argument(
-        "--source", choices=["auto", "smb", "local"], default="auto", help="班表来源，默认先 SMB 后本地"
-    )
     parser.add_argument("--dry-run", action="store_true", help="只打印消息，不发送 Webhook")
     parser.add_argument(
         "--contacts", default=str(CONTACTS_FILE), help=f"通讯录文件，默认 {CONTACTS_FILE.name}"
@@ -575,39 +736,11 @@ def main(argv: list[str] | None = None) -> int:
 
     env = {**load_env(ENV_FILE), **os.environ}
     try:
-        documents = fetch_schedules(args.source, Path(args.csv_dir), env, target)
-    except FileNotFoundError as exc:
-        logger.error("%s", exc)
+        return run(args, env, target)
+    except Exception as exc:  # noqa: BLE001 - 兜底：任何意外都告警，别静默失败
+        logger.exception("运行异常终止")
+        notify_failure(env, target, exc, smb_path(env), args.dry_run)
         return 1
-    entry, source = collect_schedule(documents, target)
-
-    contacts = load_contacts(Path(args.contacts))
-    message, mobiles = build_message(target, entry, source, contacts)
-    for name, mobile in contacts.items():
-        if mobile in mobiles:
-            logger.debug("将 @ %s（%s）", name, mobile)
-
-    logger.info("消息内容：\n%s", message)
-
-    if args.dry_run:
-        logger.info("[dry-run] 未发送。")
-        return 0
-
-    webhook_url = env.get("WEBHOOK_URL") or ""
-    if not webhook_url:
-        webhook_key = env.get("WEBHOOK_KEY", "").strip()
-        if not webhook_key:
-            logger.error("缺少 WEBHOOK_KEY / WEBHOOK_URL，请在 .env 中配置")
-            return 1
-        webhook_url = f"{WEBHOOK_BASE}?key={webhook_key}"
-
-    try:
-        send_wechat_text(webhook_url, message, mobiles)
-    except (urllib.error.URLError, RuntimeError, OSError) as exc:
-        logger.exception("发送失败：%s", exc)
-        return 1
-    logger.info("=== 值班提醒完成 ===")
-    return 0
 
 
 if __name__ == "__main__":

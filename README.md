@@ -21,6 +21,9 @@ SMB_USERNAME=nas_batch_operation
 SMB_PASSWORD=xxxxxxxx
 SMB_DIR=Settlement Internal\结算部排班表   # 第一段是共享名，后面是子目录
 # 可选：SMB_SHARE=ShareName（SMB_DIR 只有子目录时用）、SMB_PORT=445
+
+# 可选：失败告警 @ 谁（逗号分隔手机号）；不配则 @all
+# ALERT_MOBILES=85259887686,85253004454
 ```
 
 ## 使用
@@ -29,21 +32,39 @@ SMB_DIR=Settlement Internal\结算部排班表   # 第一段是共享名，后�
 .\.venv\Scripts\python.exe main.py            # 提醒明天的值班并发送
 .\.venv\Scripts\python.exe main.py --dry-run  # 只打印消息，不发送（自测用）
 uv run main.py --date 2026-09-29              # 指定日期
-uv run main.py --source local                 # 强制读本地 outlook/*.csv（SMB 不可用时的兜底）
-uv run main.py --csv-dir D:\share             # 本地模式下的 CSV 目录
 uv run main.py --contacts C:\duty\contacts.json
 uv run main.py --log-dir D:\logs --log-level DEBUG
 ```
 
 ## 班表来源
 
-1. **SMB（默认）**：列出 `SMB_DIR` 下的 `*.xlsx/*.csv`，取文件名含目标年份的那份；
-   xlsx 按「N 月」sheet 解析，只解析目标月及相邻月（跨月边缘的日期会用得上）。
-2. **本地兜底**：SMB 连不上或没配时，读 `outlook/*.csv`（Outlook 月视图导出）。
+**班表来源只有 SMB**：列出 `SMB_DIR` 下的 `*.xlsx/*.csv`，取文件名含目标年份的那份；
+xlsx 按「N 月」sheet 解析，只解析目标月及相邻月（跨月边缘的日期会用得上）。
+未配置 `SMB_SERVER` / `SMB_DIR`，或目录下没有班表文件时直接报错退出。
 
-两种格式都是同一套「月历网格」结构：标题行含年月（`2026 年 9 月`），
+班表是「月历网格」结构：标题行含年月（`2026 年 9 月`），
 其次是星期行，之后「日期行 / 内容行」交替；单元格内 `任务 : 人员` 为值班安排，
 `*` 开头的行作为备注（如 `*Wesley 放假`）。
+
+## 运行失败告警
+
+取不到班表时（共享权限被关、账号失效、路径/网络故障、目录里没有班表）
+**不会静默退出**，会往同一个群里发一条 `【值班提醒运行失败】`，说明失败原因、
+共享路径和失败时间，并 @ 人（默认 `@all`，可用 `ALERT_MOBILES` 指定）：
+
+```
+【值班提醒运行失败】
+2026-10-10 星期六
+
+失败时间：2026-10-09 09:44:01
+失败原因：无法列出 \\10.202.7.240\Settlement Internal\结算部排班表：访问被拒绝：共享目录权限被关闭，或账号已失效（NtStatus 0xc0000022）
+共享路径：\\10.202.7.240\Settlement Internal\结算部排班表
+
+今天没有发出明日值班提醒，请检查共享目录权限 / SMB 账号后手动补发。
+```
+
+常见的 NtStatus 会被翻成人话（`0xc0000022` 权限被拒、`0xc000006d` 账号密码错、
+`0xc00000cc` 共享名不存在…），原始状态码一并保留。`--dry-run` 下只打印不发送。
 
 ## @ 提醒（通讯录）
 
