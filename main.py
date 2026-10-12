@@ -26,6 +26,7 @@ import logging.handlers
 import os
 import re
 import sys
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -249,6 +250,8 @@ def smb_list_files(cfg: SmbConfig) -> list[tuple[str, float]]:
         entries = []
         with smbclient.scandir(cfg.unc()) as it:
             for entry in it:
+                if entry.name.startswith("~$"):
+                    continue  # Excel 打开时的临时锁文件，跳过
                 if entry.is_file() and entry.name.lower().endswith((".xlsx", ".xlsm", ".csv")):
                     entries.append((entry.name, entry.stat().st_mtime))
     except Exception as exc:
@@ -261,14 +264,29 @@ def smb_list_files(cfg: SmbConfig) -> list[tuple[str, float]]:
     return entries
 
 
-def smb_read_bytes(cfg: SmbConfig, name: str) -> bytes:
-    """从 SMB 读取一个文件的原始字节。"""
+def smb_read_bytes(cfg: SmbConfig, name: str, retries: int = 3, delay: float = 3.0) -> bytes:
+    """从 SMB 读取一个文件的原始字节。
+
+    用共享模式打开（share_access="rwd"），这样即使别人正在用 Excel 编辑班表
+    （NtStatus 0xc0000043 共享冲突）也仍能读取；再配合短暂重试兜底。
+    """
     smbclient = smb_session(cfg)
     try:
-        with smbclient.open_file(cfg.unc(name), mode="rb") as fh:
-            data = fh.read()
-    except Exception as exc:
-        raise SmbAccessError(f"无法读取 {cfg.unc(name)}：{describe_smb_error(exc)}") from exc
+        for attempt in range(1, retries + 1):
+            try:
+                with smbclient.open_file(cfg.unc(name), mode="rb", share_access="rwd") as fh:
+                    data = fh.read()
+                break
+            except Exception as exc:
+                if attempt >= retries:
+                    raise SmbAccessError(
+                        f"无法读取 {cfg.unc(name)}：{describe_smb_error(exc)}"
+                    ) from exc
+                logger.warning(
+                    "读取 %s 第 %d/%d 次失败（%s），%d 秒后重试",
+                    name, attempt, retries, describe_smb_error(exc), delay,
+                )
+                time.sleep(delay)
     finally:
         smbclient.delete_session(cfg.server, port=cfg.port)
 
